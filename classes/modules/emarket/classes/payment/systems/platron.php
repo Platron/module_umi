@@ -30,10 +30,13 @@ class platronPayment extends payment {
 		$bDemoMode = ( @$this->object->demo_mode ) ? 1 : 0;
 		$nLifeTime = ( @$this->object->lifetime ) ? $this->object->lifetime*60 : 0;
 
+		$currency = strtoupper( mainConfiguration::getInstance()->get('system', 'default-currency') );
+		if ($currency == 'RUR') $currency = 'RUB';
+
 		$arrFields = array(
 			'pg_merchant_id'	=> $this->object->merchant_id,
 			'pg_order_id'		=> $this->order->id,
-			'pg_currency'		=> strtoupper( mainConfiguration::getInstance()->get('system', 'default-currency') ),
+			'pg_currency'		=> $currency,
 			'pg_amount'			=> number_format($this->order->getActualPrice(), 2, '.', ''),
 			'pg_lifetime'		=> $nLifeTime,
 			'pg_testing_mode'	=> $bDemoMode,
@@ -48,9 +51,10 @@ class platronPayment extends payment {
 			'cms_payment_module'=> 'UMICMS',
 		);
 
-		if(!empty($this->object->payment_system) && !$bDemoMode)
+		if(!empty($this->object->payment_system) && !$bDemoMode){
 			$arrFields['pg_payment_system'] = $this->object->payment_system;
-
+        }
+        
 		$user_id = $this->order->getValue('customer_id');
 		$userObject = umiObjectsCollection::getInstance()->getObject( $user_id );
 		
@@ -63,12 +67,104 @@ class platronPayment extends payment {
 		
 		$arrFields['pg_user_email'] = $strMaybeEmail;
 		$arrFields['pg_user_contact_email'] = $strMaybeEmail;
-		
+
+		$arrFields['pg_sig'] = PG_Signature::make('init_payment.php', $arrFields, $this->object->secret_key);
+
+		$response = file_get_contents('https://www.platron.ru/init_payment.php?' . http_build_query($arrFields));
+		$responseElement = new SimpleXMLElement($response);
+
+		$checkResponse = PG_Signature::checkXML('init_payment.php', $responseElement, $this->object->secret_key);
+
+	   	if ($checkResponse && (string)$responseElement->pg_status == 'ok') {
+
+			$bCreateOfdCheck = ( @$this->object->create_ofd_check ) ? 1 : 0;
+
+   			if ($bCreateOfdCheck == 1) {
+
+       			$paymentId = (string)$responseElement->pg_payment_id;
+
+				$VATstr = $this->getVatNameFromTaxDescription( @$this->object->ofd_vat_type );
+
+       	        $ofdReceiptItems = array();
+       			foreach($this->order->getItems() as $objItem) {
+       	            $ofdReceiptItem = new OfdReceiptItem();
+       	            $ofdReceiptItem->label = $objItem->getName();
+       	            $ofdReceiptItem->amount = round($objItem->getItemPrice() * $objItem->getAmount(), 2);
+       	            $ofdReceiptItem->price = round($objItem->getItemPrice(), 2);
+       	            $ofdReceiptItem->quantity = $objItem->getAmount();
+       	            $ofdReceiptItem->vat = $VATstr;
+       	            $ofdReceiptItems[] = $ofdReceiptItem;
+           		}
+
+				$umiObjectsCollection = umiObjectsCollection::getInstance();
+				$delivery = $umiObjectsCollection->getObject($this->order->getValue("delivery_id"));
+
+				if ($delivery) {
+					$shipping_name = $delivery->getName();
+					$shipping = $this->order->getDeliveryPrice();
+					if ($shipping > 0) {
+	       				$ofdReceiptItem = new OfdReceiptItem();
+	       				$ofdReceiptItem->label = trim($shipping_name);
+	       				$ofdReceiptItem->amount = round($shipping, 2);
+    	   				$ofdReceiptItem->price = round($shipping, 2);
+	       				$ofdReceiptItem->quantity = 1;
+	       				$ofdReceiptItem->vat = $VATstr == 'none'? 'none': '18';
+	       				$ofdReceiptItems[] = $ofdReceiptItem;
+					}
+				} 
+
+       			$ofdReceiptRequest = new OfdReceiptRequest($this->object->merchant_id, $paymentId);
+       			$ofdReceiptRequest->items = $ofdReceiptItems;
+       			$ofdReceiptRequest->sign($this->object->secret_key);
+
+       			$responseOfd = file_get_contents('https://www.platron.ru/receipt.php?' . http_build_query($ofdReceiptRequest->requestArray()));
+       			$responseElementOfd = new SimpleXMLElement($responseOfd);
+
+       			if ((string)$responseElementOfd->pg_status != 'ok')
+					throw new Exception('Platron create OFD check error. ' . $responseElementOfd->pg_error_description);
+
+       		}
+
+    	} else {
+
+			throw new Exception('Platron init payment error. ' . $responseElement->pg_error_description);
+
+    	}
+
 		$arrFields['pg_sig'] = PG_Signature::make('payment.php', $arrFields, $this->object->secret_key);
+		$arrFields['pg_url'] = (string)$responseElement->pg_redirect_url;
+
 		$this->order->setPaymentStatus('initialized');
 		
 		list($templateString) = def_module::loadTemplates("emarket/payment/platron/".$template, "form_block");
 		return def_module::parseTemplate($templateString, $arrFields);
+	}
+
+	public function getVatNameFromTaxDescription($taxId) {
+		$taxGuideId = umiObjectTypesCollection::getInstance()
+				->getTypeIdByGUID('tax-rate-guide');
+		$taxList = umiObjectsCollection::getInstance()
+				->getGuidedItems($taxGuideId);
+        
+        
+		if ($taxList[$taxId]) {
+			if (strpos ($taxList[$taxId], '18/118') !== false) return '118';
+			if (strpos ($taxList[$taxId], '10/100') !== false) return '110';
+			if (strpos ($taxList[$taxId], '18%') !== false) return '18';
+			if (strpos ($taxList[$taxId], '10%') !== false) return '10';
+            if (strpos ($taxList[$taxId], '0%') !== false) return '0';
+		}
+
+		return 'none';
+
+		/*
+			[40] => Без НДС 
+			[44] => НДС по расчетной ставке 10/110 
+			[45] => НДС по расчетной ставке 18/118 
+			[41] => НДС по ставке 0% 
+			[42] => НДС по ставке 10% 
+			[43] => НДС по ставке 18% )
+		*/
 	}
 
 	public function poll() {
@@ -156,6 +252,16 @@ class platronPayment extends payment {
 		$buffer->push($objResponse->asXML());
 		$buffer->end();
 	}
+    
+        
+    /**
+	 *
+	 * @param string $url
+	 * @return string URL with prefix-protocol if not exist
+	 */
+	private function _http($url) {
+		return strpos( $url, 'http://' ) === 0 || strpos( $url, 'https://' ) === 0 ? $url : 'http://' . $url;
+	}
 };
 	
 
@@ -196,8 +302,7 @@ class PG_Signature {
 	 */
 	public static function make ( $strScriptName, $arrParams, $strSecretKey )
 	{
-		$arrFlatParams = self::makeFlatParamsArray($arrParams);
-		return md5( self::makeSigStr($strScriptName, $arrFlatParams, $strSecretKey) );
+		return md5( self::makeSigStr($strScriptName, $arrParams, $strSecretKey) );
 	}
 
 	/**
@@ -227,15 +332,27 @@ class PG_Signature {
 	}
 
 
-	private static function makeSigStr ( $strScriptName, array $arrParams, $strSecretKey ) {
+	private static function makeSigStr ( $strScriptName, $arrParams, $strSecretKey ) {
 		unset($arrParams['pg_sig']);
-		
 		ksort($arrParams);
+		return $strScriptName .';' . self::arJoin($arrParams) . ';' . $strSecretKey;
+	}
 
-		array_unshift($arrParams, $strScriptName);
-		array_push   ($arrParams, $strSecretKey);
+	private static function arJoin ($in) {
+		return rtrim(self::arJoinProcess($in, ''), ';');
+	}
 
-		return join(';', $arrParams);
+	private static function arJoinProcess ($in, $str) {
+		if (is_array($in)) {
+			ksort($in);
+			$s = '';
+			foreach($in as $v) {
+				$s .= self::arJoinProcess($v, $str);
+			}
+			return $s;
+		} else {
+			return $str . $in . ';';
+		}
 	}
 	
 	private static function makeFlatParamsArray ( $arrParams, $parent_name = '' )
@@ -345,6 +462,94 @@ class PG_Signature {
 		}
 
 		return $arrParams;
+	}
+}
+
+class OfdReceiptRequest
+{
+	const SCRIPT_NAME = 'receipt.php';
+
+	public $merchantId;
+	public $operationType = 'payment';
+	public $paymentId;
+	public $items = array();
+
+	private $params = array();
+
+	public function __construct($merchantId, $paymentId)
+	{
+		$this->merchantId = $merchantId;
+		$this->paymentId = $paymentId;
+	}
+
+	public function sign($secretKey)
+	{
+		$params = $this->toArray();
+		$params['pg_salt'] = 'salt';
+		$params['pg_sig'] = PG_Signature::make(self::SCRIPT_NAME, $params, $secretKey);
+		$this->params = $params;
+	}
+
+	public function toArray()
+	{
+		$result = array();
+
+		$result['pg_merchant_id'] = $this->merchantId;
+		$result['pg_operation_type'] = $this->operationType;
+		$result['pg_payment_id'] = $this->paymentId;
+
+		foreach ($this->items as $item) {
+			$result['pg_items'][] = $item->toArray();
+		}
+
+		return $result;
+	}
+
+	public function requestArray()
+	{
+		return $this->params;
+	}
+
+	public function makeXml()
+	{
+		$xmlElement = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><request></request>');
+
+		foreach ($this->params as $paramName => $paramValue) {
+			if ($paramName == 'pg_items') {
+				//$itemsElement = $xmlElement->addChild($paramName);
+				foreach ($paramValue as $itemParams) {
+					$itemElement = $xmlElement->addChild($paramName);
+					foreach ($itemParams as $itemParamName => $itemParamValue) {
+						$itemElement->addChild($itemParamName, $itemParamValue);
+					}
+				}
+				continue;
+			}
+
+			$xmlElement->addChild($paramName, $paramValue);
+		}
+
+		return $xmlElement->asXML();
+	}
+}
+
+class OfdReceiptItem
+{
+	public $label;
+	public $amount;
+	public $price;
+	public $quantity;
+	public $vat;
+
+	public function toArray()
+	{
+		return array(
+			'pg_label' => extension_loaded('mbstring') ? mb_substr($this->label, 0, 128) : substr($this->label, 0, 128),
+			#'pg_amount' => $this->amount,
+			'pg_price' => $this->price,
+			'pg_quantity' => $this->quantity,
+			'pg_vat' => $this->vat,
+		);
 	}
 }
 ?>
